@@ -4,13 +4,13 @@ from tqdm import tqdm
 from src.evaluation.utils.models import get_model, SimilarityModel
 from src.evaluation.utils.utils import *
 from src.evaluation.utils.datasets import EvalDataset
-from data_utils import create_dir
+from src.pre_process.data_utils import create_dir
 from typing import Union
 import pandas as pd
 from src.evaluation.utils.metrics import compute_metrics
 import sys
 import logging
-
+import torch
 
 def encode(model: SimilarityModel, dataset: EvalDataset):
     """
@@ -81,7 +81,23 @@ def score(model: SimilarityModel,
         json.dump(results, fp)
         logging.info(f'Wrote: {scores_filename}')
 
+def get_query_test_or_dev_split(query_id, data):
+    """
+    Determines the split (e.g., test, dev, etc.) that a given query ID belongs to.
 
+    Args:
+        query_id (str): The query ID whose split category needs to be identified.
+        data (dict): A dictionary where keys are split names (e.g., 'test', 'dev', etc.)
+                     and values are lists or sets of query IDs belonging to that split.
+
+    Returns:
+        str or None: The key of the split (e.g., 'test', 'dev') if the query ID is found in
+                     any of  the lists; None if the query ID is not found in any split.
+    """
+    for key, vals in data.items():
+        if query_id in set(vals):
+            return key
+    return None
 def evaluate(results_dir: str,
              facet: Union[str, None],
              dataset: EvalDataset,
@@ -123,7 +139,9 @@ def evaluate(results_dir: str,
             if metric_columns is None:
                 metric_columns = list(query_metrics.keys())
             query_metrics['facet'] = facet_i
-            query_metrics['split'] = 'test' if query_test_dev_split is None else query_test_dev_split[query_id]
+            # query_metrics['split'] = 'test' if query_test_dev_split is None else query_test_dev_split[query_id]
+            query_metrics['split'] = 'test' if query_test_dev_split is None else get_query_test_or_dev_split(query_id, query_test_dev_split)
+
             query_metrics['paper_id'] = query_id
             query_metrics['title'] = query_metadata.loc[query_id]['title']
             metrics.append(query_metrics)

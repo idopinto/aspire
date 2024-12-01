@@ -37,6 +37,17 @@ class AspireConSent(nn.Module):
         self.bert_layer_count = 12 + 1  # plus 1 for the bottom most layer.
         self.bert_encoder = AutoModel.from_pretrained(hf_model_name)
         self.bert_encoder.config.output_hidden_states = True
+
+        # mine
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') #!
+        self.bert_encoder.to(self.device) # !
+        # Move the model to the GPU if available
+        device = next(self.bert_encoder.parameters()).device
+        if device.type == 'cuda':
+            print("Model is on the GPU.")
+        else:
+            print("Model is on the CPU.")
+
     
     def forward(self, bert_batch, abs_lens, sent_tok_idxs):
         """
@@ -71,8 +82,8 @@ class AspireConSent(nn.Module):
         batch_size, max_seq_len = len(seq_lens), max(seq_lens)
         max_sents = max(num_sents)
         tokid_tt, seg_tt, attnmask_tt = bert_batch['tokid_tt'], bert_batch['seg_tt'], bert_batch['attnmask_tt']
-        # if torch.cuda.is_available():
-        #     tokid_tt, seg_tt, attnmask_tt = tokid_tt.cuda(), seg_tt.cuda(), attnmask_tt.cuda()
+        if torch.cuda.is_available():
+            tokid_tt, seg_tt, attnmask_tt = tokid_tt.cuda(), seg_tt.cuda(), attnmask_tt.cuda()
         # Pass input through BERT and return all layer hidden outputs.
         model_outputs = self.bert_encoder(tokid_tt, token_type_ids=seg_tt, attention_mask=attnmask_tt)
         final_hidden_state = model_outputs.last_hidden_state
@@ -93,8 +104,8 @@ class AspireConSent(nn.Module):
                     sent_i_tok_idxs = []
                 cur_sent_mask[batch_abs_i, sent_i_tok_idxs, :] = 1.0
             sent_mask = Variable(torch.FloatTensor(cur_sent_mask))
-            # if torch.cuda.is_available():
-            #     sent_mask = sent_mask.cuda()
+            if torch.cuda.is_available():
+                sent_mask = sent_mask.cuda()
             # batch_size x seq_len x encoding_dim
             sent_tokens = final_hidden_state * sent_mask
             # The sent_masks non zero elements in one slice along embedding dim is the sentence length.
@@ -138,13 +149,17 @@ class AllPairMaskedWasserstein:
             ql, cl = query_abs_lens[i], cand_abs_lens[i]
             pad_mask[i, :ql, :cl] = 0.0
         pad_mask = Variable(torch.FloatTensor(pad_mask))
-        # if torch.cuda.is_available():
-        #     pad_mask = pad_mask.cuda()
+        if torch.cuda.is_available():
+            query_reps = query_reps.cuda()
+            cand_reps = cand_reps.cuda()
+            pad_mask = pad_mask.cuda()
         assert (qef_batch_size == cef_batch_size)
         # (effective) batch_size x qmax_sents x cmax_sents
         # inputs are: batch_size x encoding_dim x c/qmax_sents so permute them.
         neg_pair_dists = -1*torch.cdist(query_reps.permute(0, 2, 1).contiguous(),
                                         cand_reps.permute(0, 2, 1).contiguous())
+        if torch.cuda.is_available():
+            neg_pair_dists = neg_pair_dists.cuda()
         if len(neg_pair_dists.size()) == 2:
             neg_pair_dists = neg_pair_dists.unsqueeze(0)
         assert (neg_pair_dists.size(1) == qmax_sents)
@@ -182,6 +197,7 @@ class AllPairMaskedWasserstein:
             wasserstein_dists = torch.sum(torch.sum(masked_sims, dim=1), dim=1)
             return wasserstein_dists, [query_distr, cand_distr, pair_sims, transport_plan, masked_sims]
         else:
+            # print(f"query_distr device: {query_distr.device}, cand_distr device: {cand_distr.device}\n query_reps device: {query_reps.device}, cand_reps device: {cand_reps.device}")
             ot_solver_distance = geomloss.SamplesLoss("sinkhorn", p=1, blur=self.geoml_blur, reach=self.geoml_reach,
                                                       scaling=self.geoml_scaling, debias=False, potentials=False)
             wasserstein_dists = ot_solver_distance(query_distr, query_reps.permute(0, 2, 1).contiguous(),

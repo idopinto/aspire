@@ -95,12 +95,13 @@ class DirMetaIterator:
                 batch_num = int(batch_fname[15:-6])
             else:
                 if str.endswith(batch_fname, 'jsonl.gz'):
-                    batch_num = int(batch_fname[:-9])
+                    batch_num = int(batch_fname.split('.')[0].split('_')[-1])
+                    # batch_num = int(batch_fname[:-9])
                 elif str.endswith(batch_fname, '.jsonl'):
                     batch_num = int(batch_fname[:-6])
             if isinstance(self.metadata_df, pd.DataFrame):
                 batch_metadata_df = self.metadata_df[self.metadata_df['batch_num'] == batch_num]
-                pids = set(batch_metadata_df['pid'].values)
+                pids = set(batch_metadata_df['paper_id'].values)
             elif isinstance(self.metadata_df, dict):
                 pids = set(self.metadata_df[batch_num])
                 pids = [int(p) for p in pids]

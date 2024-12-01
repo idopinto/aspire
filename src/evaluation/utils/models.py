@@ -1,6 +1,7 @@
 from abc import ABCMeta, abstractmethod
-from ex_aspire_consent import AspireConSent, AutoTokenizer, prepare_abstracts, AutoModel
-from ex_aspire_consent_multimatch import AllPairMaskedWasserstein
+from transformers import AutoModel, AutoTokenizer
+from examples.ex_aspire_consent import AspireConSent, prepare_abstracts
+from examples.ex_aspire_consent_multimatch import AspireConSent, AllPairMaskedWasserstein
 from src.learning.facetid_models import disent_models
 from src.learning import batchers
 from collections import namedtuple

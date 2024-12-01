@@ -2,7 +2,7 @@ import codecs
 import os
 import json
 from src.evaluation.utils.datasets import EvalDataset
-from data_utils import create_dir
+from src.pre_process.data_utils import create_dir
 from typing import Dict
 
 FACETS = ('background', 'method', 'result')

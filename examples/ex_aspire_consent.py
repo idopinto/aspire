@@ -33,6 +33,16 @@ class AspireConSent(nn.Module):
         self.bert_encoder = AutoModel.from_pretrained(hf_model_name)
         self.bert_encoder.config.output_hidden_states = True
 
+        # mine
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') #!
+        self.bert_encoder.to(self.device) # !
+        # Move the model to the GPU if available
+        device = next(self.bert_encoder.parameters()).device
+        if device.type == 'cuda':
+            print("Model is on the GPU.")
+        else:
+            print("Model is on the CPU.")
+
     def forward(self, bert_batch, abs_lens, sent_tok_idxs):
         """
         Pass a batch of sentences through BERT and get sentence
@@ -66,8 +76,8 @@ class AspireConSent(nn.Module):
         batch_size, max_seq_len = len(seq_lens), max(seq_lens)
         max_sents = max(num_sents)
         tokid_tt, seg_tt, attnmask_tt = bert_batch['tokid_tt'], bert_batch['seg_tt'], bert_batch['attnmask_tt']
-        # if torch.cuda.is_available():
-        #     tokid_tt, seg_tt, attnmask_tt = tokid_tt.cuda(), seg_tt.cuda(), attnmask_tt.cuda()
+        if torch.cuda.is_available():
+            tokid_tt, seg_tt, attnmask_tt = tokid_tt.cuda(), seg_tt.cuda(), attnmask_tt.cuda()
         # Pass input through BERT and return all layer hidden outputs.
         model_outputs = self.bert_encoder(tokid_tt, token_type_ids=seg_tt, attention_mask=attnmask_tt)
         final_hidden_state = model_outputs.last_hidden_state
@@ -88,8 +98,8 @@ class AspireConSent(nn.Module):
                     sent_i_tok_idxs = []
                 cur_sent_mask[batch_abs_i, sent_i_tok_idxs, :] = 1.0
             sent_mask = Variable(torch.FloatTensor(cur_sent_mask))
-            # if torch.cuda.is_available():
-            #     sent_mask = sent_mask.cuda()
+            if torch.cuda.is_available():
+                sent_mask = sent_mask.cuda()
             # batch_size x seq_len x encoding_dim
             sent_tokens = final_hidden_state * sent_mask
             # The sent_masks non zero elements in one slice along embedding dim is the sentence length.

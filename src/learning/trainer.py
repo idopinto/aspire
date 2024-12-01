@@ -759,7 +759,7 @@ class BasicRankingTrainerDDP(GenericTrainerDDP):
             # Each run contains a copy of shuffled data for itself
             # Each process gets a part of the data to consume in training.
             ex_fname = {
-                'pos_ex_fname': os.path.join(model_path, 'shuffled_data', f'{train_basename}-{process_rank}-{i}.jsonl'),
+                'pos_ex_fname': os.path.join(data_path, 'shuffled_data', f'{train_basename}-{process_rank}-{i}.jsonl'),
             }
             self.train_fnames.append(ex_fname)
         self.dev_fnames = {
