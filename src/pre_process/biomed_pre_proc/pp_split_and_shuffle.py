@@ -64,9 +64,9 @@ def main():
         None
     """
     shuffle_and_split(
-        dataset_file='/cs/labs/tomhope/idopinto12/aspire/datasets/train/train-cocitabsalign.jsonl',
-        output_dir='/cs/labs/tomhope/idopinto12/aspire/datasets/train/shuffled_data/',
-        num_gpus=8,
+        dataset_file='/cs/labs/tomhope/idopinto12/aspire_new/datasets/train/train-cocitabsalign.jsonl',
+        output_dir='/cs/labs/tomhope/idopinto12/aspire_new/datasets/train/shuffled_data/',
+        num_gpus=2,
         num_epochs=1,  # Number of epochs to shuffle and split the data
         suffix="cocitabsalign"
     )

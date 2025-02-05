@@ -55,8 +55,7 @@ def read_json(json_file):
         # Try to manually skip bad chars.
         # https://stackoverflow.com/a/9295597/3262406
         try:
-            f_dict = json.loads(json_line.replace('\r\n', '\\r\\n'),
-                                encoding='utf-8')
+            f_dict = json.loads(json_line.replace('\r\n', '\\r\\n')) # encoding='utf-8' is deprecated since python 3.1 and unnecessary python 3.6+
             yield f_dict
         # Skip case which crazy escape characters.
         except ValueError:

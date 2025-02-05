@@ -11,10 +11,9 @@ import torch
 import torch.multiprocessing as torch_mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from . import batchers, trainer
-from .facetid_models import disent_models
-
-
+from src.learning import batchers, trainer
+from src.learning.facetid_models import disent_models
+import wandb
 # Copying from: https://discuss.pytorch.org/t/why-do-we-have-to-create-logger-in-process-for-correct-logging-in-ddp/102164/3
 # Had double printing errors, solution finagled from:
 # https://stackoverflow.com/q/6729268/3262406
@@ -29,14 +28,14 @@ def get_logger():
         handler
     )
     logger.setLevel(logging.INFO)
-    
+
     return logger
 
 
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    
+    os.environ['MASTER_PORT'] = '12355' #'29500'
+
     # initialize the process group
     dist.init_process_group(
         backend='nccl',
@@ -44,7 +43,7 @@ def setup_ddp(rank, world_size):
         rank=rank,
         timeout=datetime.timedelta(0, 3600)
     )
-    
+
 
 def cleanup_ddp():
     dist.destroy_process_group()
@@ -71,7 +70,7 @@ def ddp_train_model(process_rank, args):
     with codecs.open(config_path, 'r', 'utf-8') as fp:
         all_hparams = json.load(fp)
     setup_ddp(rank=process_rank, world_size=cl_args.num_gpus)
-    
+
     # Setup logging and experiment tracking.
     if process_rank == 0:
         # Print the called script and its args to the log.
@@ -86,7 +85,7 @@ def ddp_train_model(process_rank, args):
             json.dump(run_info, fp)
     else:
         logger = None
-        
+
     # Initialize model.
     if model_name in {'cospecter'}:
         model = disent_models.MySPECTER(model_hparams=all_hparams)
@@ -105,14 +104,14 @@ def ddp_train_model(process_rank, args):
         # Save an untrained model version.
         trainer.generic_save_function_ddp(model=model, save_path=run_path, model_suffix='init')
         print(model)
-    
+
     # Move model to the GPU.
     torch.cuda.set_device(process_rank)
     if torch.cuda.is_available():
         model.cuda(process_rank)
         if process_rank == 0: print('Running on GPU.')
     model = DistributedDataParallel(model, device_ids=[process_rank], find_unused_parameters=True)
-    
+
     # Initialize the trainer.
     if model_name in ['cospecter']:
         batcher_cls = batchers.AbsTripleBatcher
@@ -127,7 +126,7 @@ def ddp_train_model(process_rank, args):
         batcher_cls.bert_config_str = all_hparams['base-pt-layer']
     else:
         sys.exit(1)
-        
+
     if model_name in ['cospecter', 'miswordbienc',
                       'miswordpolyenc', 'sbalisentbienc']:
         model_trainer = trainer.BasicRankingTrainerDDP(
@@ -239,6 +238,8 @@ def main():
                             help='Path to directory to save all run items to.')
     train_args.add_argument('--config_path', required=True,
                             help='Path to directory json config file for model.')
+    # train_args.add_argument('--log_fname',
+    #                         help='Path to directory to save log files.')
     cl_args = parser.parse_args()
     # If a log file was passed then write to it.
 

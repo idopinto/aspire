@@ -470,7 +470,7 @@ def conditional_log(logger, process_rank, message):
     -- logger is entirely unused. Dint seem to work when used in conjuncton with cometml.
     """
     if process_rank == 0:
-        print(message)
+        logger.info(message)
 
 
 class GenericTrainerDDP:
@@ -530,7 +530,7 @@ class GenericTrainerDDP:
                        and self.accumulated_batch_size % self.batch_size == 0)
                 self.accumulate_gradients = True
                 self.update_params_every = self.accumulated_batch_size/self.batch_size
-                conditional_log(logger, process_rank,
+                conditional_log(self.logger, self.process_rank,
                                 'Accumulating gradients for: {:}; updating params every: {:}; with batch size: {:}'
                                 .format(self.accumulated_batch_size, self.update_params_every, self.batch_size))
             else:

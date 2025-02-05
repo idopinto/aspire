@@ -185,6 +185,7 @@ def aggregate_metrics(query_metrics):
         if 'ndcg' in metrics:
             ndcg += metrics['ndcg']
             ndcg_20 += metrics['ndcg@20']
+
             ndcg_50 += metrics['ndcg@50']
             ndcg_pr_5 += metrics['ndcg%5']
             ndcg_pr_10 += metrics['ndcg%10']
@@ -548,7 +549,9 @@ def graded_eval_pool_rerank_unf(data_path, run_path, method, dataset, split, com
     print(f'EVAL SPLIT: {split}; Number of queries: {len(split_paper_ids)}')
     with codecs.open(os.path.join(data_path, f'{dataset}-queries-release.csv')) as csvfile:
         reader = csv.DictReader(csvfile)
-        query_metadata = dict([(row['paper_id'], row) for row in reader])
+        query_metadata = dict([(row['pid'], row) for row in reader])
+
+        # query_metadata = dict([(row['paper_id'], row) for row in reader])
     
     perq_out_fname = os.path.join(run_path, f'test-pid2pool-{dataset}-{method}-{split}-perq.txt')
     qpid2rankedcand_relevances = read_unf_relevances(data_path=data_path, run_path=run_path,
@@ -582,31 +585,32 @@ def graded_eval_pool_rerank_unf(data_path, run_path, method, dataset, split, com
     perq_file.close()
     print('Total queries: {:d}; Total candidates: {:d}'.format(int(num_queries), int(num_cands)))
     # Precision and recall dont make too much sense.
-    print('R-Precision; Precision@5; Precision@10; Precision@20; Recall@20; MAPrecision; NDCG; NDCG@20; NDCG%20')
-    print('{:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}\n'.
-          format(aggmetrics['r_precision'],
-                 aggmetrics['precision@5'], aggmetrics['precision@10'], aggmetrics['precision@20'],
-                 aggmetrics['recall@20'], aggmetrics['mean_av_precision'], aggmetrics['ndcg'],
-                 aggmetrics['ndcg@20'], aggmetrics['ndcg%20']))
+    # print('R-Precision; Precision@5; Precision@10; Precision@20; Recall@20; MAPrecision; NDCG; NDCG@20; NDCG%20')
+    # print('{:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}\n'.
+    #       format(aggmetrics['r_precision'],
+    #              aggmetrics['precision@5'], aggmetrics['precision@10'], aggmetrics['precision@20'],
+    #              aggmetrics['recall@20'], aggmetrics['mean_av_precision'], aggmetrics['ndcg'],
+    #              aggmetrics['ndcg@20'], aggmetrics['ndcg%20']))
+    print(f"NDCG%20: {aggmetrics['ndcg%20']*100:.2f}, MAP: {aggmetrics['mean_av_precision']*100:.2f}")
     # print('NDCG; NDCG%5; NDCG%10; NDCG%15; NDCG%20; NDCG%25')
     # print('{:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}, {:.4f}\n'.
     #       format(aggmetrics['ndcg'], aggmetrics['ndcg%5'], aggmetrics['ndcg%10'], aggmetrics['ndcg%15'],
     #              aggmetrics['ndcg%20'], aggmetrics['ndcg%25']))
-    if comet_exp_key:
-        # Log metrics to comet.ml.
-        run_name = os.path.basename(run_path)
-        cml_experiment = cml.ExistingExperiment(previous_experiment=comet_exp_key, display_summary_level=0)
-        cml_experiment.set_name(run_name)
-        display_metrics = {'r_precision': aggmetrics['r_precision'],
-                           'precision@5': aggmetrics['precision@5'],
-                           'precision@10': aggmetrics['precision@10'],
-                           'precision@20': aggmetrics['precision@20'],
-                           'recall@20': aggmetrics['recall@20'],
-                           'ndcg': aggmetrics['ndcg'],
-                           'mean_av_precision': aggmetrics['mean_av_precision']}
-        cml_experiment.log_metrics(display_metrics, prefix=f'{dataset}-{split}')
-        cml_experiment.log_table(perq_out_fname, prefix=f'{dataset}-{split}')
-    
+    # if comet_exp_key:
+    #     # Log metrics to comet.ml.
+    #     run_name = os.path.basename(run_path)
+    #     cml_experiment = cml.ExistingExperiment(api_key= "6O6EgDCIGDKyqtyg9TdKIux2z",previous_experiment=comet_exp_key, display_summary_level=0)
+    #     cml_experiment.set_name(run_name)
+    #     display_metrics = {'r_precision': aggmetrics['r_precision'],
+    #                        'precision@5': aggmetrics['precision@5'],
+    #                        'precision@10': aggmetrics['precision@10'],
+    #                        'precision@20': aggmetrics['precision@20'],
+    #                        'recall@20': aggmetrics['recall@20'],
+    #                        'ndcg': aggmetrics['ndcg'],
+    #                        'mean_av_precision': aggmetrics['mean_av_precision']}
+    #     cml_experiment.log_metrics(display_metrics, prefix=f'{dataset}-{split}')
+    #     cml_experiment.log_table(perq_out_fname, prefix=f'{dataset}-{split}')
+    #
 
 def eval_significance_faceted(perq_path1, method1, perq_path2, method2, num_baseline_comparisions=2):
     """
@@ -718,6 +722,9 @@ def main():
     Parse command line arguments and call all the above routines.
     :return:
     """
+    # experiment = comet_ml.Experiment(api_key="6O6EgDCIGDKyqtyg9TdKIux2z", project_name="aspire-evaluation",
+    #                                  workspace="idopinto")
+    # print("Your experiment key is:", experiment.get_key())
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest='subcommand',
                                        help='The action to perform.')
@@ -784,6 +791,13 @@ def main():
     else:
         sys.stderr.write("Unknown action.")
 
-
+        '''
+       python evaluate_rankings.py eval_pool_ranking --data_path /cs/labs/tomhope/idopinto12/aspire/datasets/eval/Relish --run_path /cs/labs/tomhope/idopinto12/aspire/datasets/eval/Relish/sbalisentbienc/ts_aspire_biomed --experiment sbalisentbienc --dataset relish --comet_exp_key 254fdfb8fc4c4834891a7ff09948bf3c 
+        
+        
+        
+        
+        '''
+""
 if __name__ == '__main__':
     main()

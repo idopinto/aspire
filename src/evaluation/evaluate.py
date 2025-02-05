@@ -10,7 +10,7 @@ import pandas as pd
 from src.evaluation.utils.metrics import compute_metrics
 import sys
 import logging
-import torch
+
 
 def encode(model: SimilarityModel, dataset: EvalDataset):
     """

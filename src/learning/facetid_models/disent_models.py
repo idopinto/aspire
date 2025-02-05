@@ -11,7 +11,7 @@ from transformers import AutoModel
 
 from . import pair_distances as pair_dist
 from ..models_common import generic_layers as gl
-
+from loss_functions import CustomTripletMarginWithDistanceLoss
 rep_len_tup = namedtuple('RepLen', ['embed', 'abs_lens'])
 cf_rep_len_tup = namedtuple('CFRepLen', ['embed', 'embed_cf', 'abs_lens'])
 rep_len_ali_tup = namedtuple('RepLenAli', ['embed', 'abs_lens', 'align_idxs'])
@@ -703,13 +703,15 @@ class WordSentAbsSupAlignBiEnc(WordSentAbsAlignBiEnc):
         # and the abs similarity for supervision.
         weighted_sup = model_hparams.get('weighted_sup', False)
         if weighted_sup:
-            self.criterion_sentsup = nn.TripletMarginWithDistanceLoss(
-                distance_function=pair_dist.allpair_masked_dist_l2sup_weighted, margin=1.0, reduction='sum')
+            self.criterion_sentsup = CustomTripletMarginWithDistanceLoss(distance_function=pair_dist.allpair_masked_dist_l2sup_weighted, margin=1.0, reduction='sum')
+            # self.criterion_sentsup = nn.TripletMarginWithDistanceLoss(
+            #     distance_function=pair_dist.allpair_masked_dist_l2sup_weighted, margin=1.0, reduction='sum')
         else:
-            self.criterion_sentsup = nn.TripletMarginWithDistanceLoss(
+            self.criterion_sentsup = CustomTripletMarginWithDistanceLoss(
                 distance_function=pair_dist.allpair_masked_dist_l2sup, margin=1.0, reduction='sum')
-        self.criterion_sent = nn.TripletMarginWithDistanceLoss(distance_function=self.dist_function,
-                                                               margin=1.0, reduction='sum')
+        self.criterion_sent = CustomTripletMarginWithDistanceLoss(distance_function=self.dist_function, margin=1.0, reduction='sum')
+        # self.criterion_sent = nn.TripletMarginWithDistanceLoss(distance_function=self.dist_function,
+        #                                                        margin=1.0, reduction='sum')
         self.criterion_abs = nn.TripletMarginLoss(margin=1, p=2, reduction='sum')
         self.abs_loss_prop = float(model_hparams.get('abs_loss_prop', 0.0))
         self.sent_loss_prop = float(model_hparams.get('sent_loss_prop', 0.0))
@@ -806,7 +808,7 @@ class WordSentAbsSupAlignBiEnc(WordSentAbsAlignBiEnc):
             ne_cls_reps = pos_cls_rep[random_idxs]
             nabs_lens = [pabs_lens[i] for i in random_idxs.tolist()]
             neg_align_idxs = [pos_align_idxs[i] for i in random_idxs.tolist()]
-            
+
             # Bundle the lengths with the embeds so the similarity
             # function can use the lens for masking.
             query_sents = rep_len_tup(embed=qu_sent_reps, abs_lens=qabs_lens)

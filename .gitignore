@@ -1,3 +1,10 @@
 .idea/*
 .DS_Store
 examples/__pycache__
+/tests
+/scripts
+/runs
+/datasets
+.env
+/config
+/config

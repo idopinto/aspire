@@ -1,5 +1,7 @@
 from abc import ABCMeta, abstractmethod
 from transformers import AutoModel, AutoTokenizer
+
+import examples
 from examples.ex_aspire_consent import AspireConSent, prepare_abstracts
 from examples.ex_aspire_consent_multimatch import AspireConSent, AllPairMaskedWasserstein
 from src.learning.facetid_models import disent_models
@@ -92,7 +94,7 @@ class SimilarityModel(metaclass=ABCMeta):
         encodings = self.encode(batch_papers)
         for i, pid in enumerate(batch_pids):
             paper_encoding = encodings[i]
-            self.cache.create_dataset(name=pid, data=paper_encoding)
+            self.cache.create_dataset(name=pid, data=paper_encoding.cpu())
         return encodings
 
     def get_encoding(self, pids: List[str], dataset: EvalDataset) -> Dict:
@@ -734,7 +736,86 @@ class AspireContextNER(SimilarityModel):
         # call super method with this updates input
         return super(AspireContextNER, self).get_faceted_encoding(unfaceted_encoding, facet, filtered_input_data)
 
+class TrainedTSAspireModel(SimilarityModel):
+    """
+    Loads and runs TSAspire models seen in the paper
+    """
 
+    # paths to two models uploaded, trained for the compsci and biomed data, respectively
+    MODEL_PATHS = {
+        'compsci': 'allenai/aspire-contextualsentence-singlem-compsci',
+        'biomed': 'allenai/aspire-contextualsentence-singlem-biomed',
+    }
+
+    def __init__(self, **kwargs):
+        super(TrainedTSAspireModel, self).__init__(**kwargs)
+
+        # load compsci/biomed model based on name
+        dataset_type = self.name.split('_')[-1]
+        model_path = AspireModel.MODEL_PATHS[dataset_type]
+        trained_model_fname = '/cs/labs/tomhope/idopinto12/aspire/runs/models/ts-aspire-biomed-train-19450412/model_cur_best.pt'
+        self.model = examples.ex_aspire_consent.AspireConSent(model_path)
+        self.model.load_state_dict(torch.load(trained_model_fname))
+        self.model.eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    def get_similarity(self, x: Union[Tensor, np.ndarray], y: Union[Tensor, np.ndarray]):
+        # print(f" x.shape: {x.shape}, y.shape: {y.shape}")
+        pair_dists = -1*torch.cdist(x, y)
+        # print(torch.max(pair_dists))
+        return torch.max(pair_dists).item()
+
+    def encode(self, batch_papers: List[Dict]):
+        # prepare input
+        bert_batch, abs_lens, sent_token_idxs = examples.ex_aspire_consent.prepare_abstracts(batch_abs=batch_papers,
+                                                                  pt_lm_tokenizer=self.tokenizer)
+        # forward through model
+        with torch.no_grad():
+            _, batch_reps_sent = self.model.forward(bert_batch=bert_batch,
+                                                    abs_lens=abs_lens,
+                                                    sent_tok_idxs=sent_token_idxs)
+            batch_reps = [batch_reps_sent[i, :abs_lens[i]] for i in range(len(abs_lens))]
+        return batch_reps
+
+
+# class TrainedTSAspireQwen2(SimilarityModel):
+#     """
+#     Loads and runs TSAspire models seen in the paper
+#     """
+#
+#     # paths to two models uploaded, trained for the compsci and biomed data, respectively
+#     MODEL_PATHS = {
+#         'compsci': 'allenai/aspire-contextualsentence-singlem-compsci',
+#         'biomed': 'allenai/aspire-contextualsentence-singlem-biomed',
+#     }
+#
+#     def __init__(self, **kwargs):
+#         super(TrainedTSAspireModel, self).__init__(**kwargs)
+#
+#         # load compsci/biomed model based on name
+#         dataset_type = self.name.split('_')[-1]
+#         model_path = AspireModel.MODEL_PATHS[dataset_type]
+#         trained_model_fname = '/cs/labs/tomhope/idopinto12/aspire/runs/models/ts-aspire-biomed-train-19450412/model_cur_best.pt'
+#         self.model = examples.ex_aspire_consent.AspireConSent(model_path)
+#         self.model.load_state_dict(torch.load(trained_model_fname))
+#         self.model.eval()
+#         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+#
+#     def get_similarity(self, x: Union[Tensor, np.ndarray], y: Union[Tensor, np.ndarray]):
+#         pair_dists = -1 * torch.cdist(x, y)
+#         return torch.max(pair_dists).item()
+#
+#     def encode(self, batch_papers: List[Dict]):
+#         # prepare input
+#         bert_batch, abs_lens, sent_token_idxs = examples.ex_aspire_consent.prepare_abstracts(batch_abs=batch_papers,
+#                                                                   pt_lm_tokenizer=self.tokenizer)
+#         # forward through model
+#         with torch.inference_mode():
+#             _, batch_reps_sent = self.model.forward(bert_batch=bert_batch,
+#                                                     abs_lens=abs_lens,
+#                                                     sent_tok_idxs=sent_token_idxs)
+#             batch_reps = [batch_reps_sent[i, :abs_lens[i]] for i in range(len(abs_lens))]
+#         return batch_reps
 
 def get_model(model_name, trained_model_path=None) -> SimilarityModel:
     """
@@ -765,5 +846,7 @@ def get_model(model_name, trained_model_path=None) -> SimilarityModel:
         return TrainedSentModel(name=model_name,
                                 trained_model_path=trained_model_path,
                                 encoding_type='sentence')
+    elif model_name in {'ts_aspire_compsci', 'ts_aspire_biomed'}:
+        return TrainedTSAspireModel(name=model_name, encoding_type='sentence')
     else:
         raise NotImplementedError(f"No Implementation for model {model_name}")
