@@ -81,3 +81,5 @@ def load_score_results(results_dir, dataset: EvalDataset, facet):
         sorted_relevancies = [gold_test_data[query_id][pid] for pid in sorted_candidate_ids]
         results[query_id] = sorted_relevancies
     return results
+
+

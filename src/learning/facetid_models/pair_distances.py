@@ -17,7 +17,6 @@ class AllPairMaskedWasserstein:
         self.geoml_scaling = model_hparams.get('geoml_scaling', 0.9)
         self.geoml_reach = model_hparams.get('geoml_reach', None)
         self.sent_sm_temp = model_hparams.get('sent_sm_temp', 1.0)
-
     def compute_distance(self, query, cand, return_pair_sims=False):
         """
         Given a set of query and candidate reps compute the wasserstein distance between
@@ -46,8 +45,14 @@ class AllPairMaskedWasserstein:
         assert (qef_batch_size == cef_batch_size)
         # (effective) batch_size x qmax_sents x cmax_sents
         # inputs are: batch_size x encoding_dim x c/qmax_sents so permute them.
+
         neg_pair_dists = -1*torch.cdist(query_reps.permute(0, 2, 1).contiguous(),
                                         cand_reps.permute(0, 2, 1).contiguous())
+
+        # Check for NaNs after distance computation
+        # for tensor in [query_reps, cand_reps, neg_pair_dists]:
+        #     assert not torch.isnan(tensor).any(), f"NaN detected in {tensor.shape} during distance computation"
+
         if len(neg_pair_dists.size()) == 2:
             neg_pair_dists = neg_pair_dists.unsqueeze(0)
         assert (neg_pair_dists.size(1) == qmax_sents)
@@ -89,6 +94,7 @@ class AllPairMaskedWasserstein:
                                                       scaling=self.geoml_scaling, debias=False, potentials=False)
             wasserstein_dists = ot_solver_distance(query_distr, query_reps.permute(0, 2, 1).contiguous(),
                                                    cand_distr, cand_reps.permute(0, 2, 1).contiguous())
+            assert not torch.isnan(wasserstein_dists).any(), "NaN detected in Wasserstein distances!"
             return wasserstein_dists
 
 

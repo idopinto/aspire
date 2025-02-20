@@ -1,15 +1,19 @@
+import collections
 from abc import ABCMeta, abstractmethod
+from pathlib import Path
+
 from transformers import AutoModel, AutoTokenizer
 
-import examples
 from examples.ex_aspire_consent import AspireConSent, prepare_abstracts
-from examples.ex_aspire_consent_multimatch import AspireConSent, AllPairMaskedWasserstein
+from src.evaluation.utils.instruct_models import DecSimModel, InstructModelConfig
+# from examples.ex_aspire_consent_multimatch import AspireConSent, AllPairMaskedWasserstein
 from src.learning.facetid_models import disent_models
+from src.evaluation.utils.trained_models_utils import ModelType, ModelFactory, SimilarityModelConfig
 from src.learning import batchers
 from collections import namedtuple
 from scipy.spatial.distance import euclidean
 import torch
-from torch import nn, Tensor
+from torch import nn, Tensor, functional
 from torch.autograd import Variable
 import numpy as np
 import h5py
@@ -20,154 +24,10 @@ import logging
 import codecs
 import json
 import os
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Tuple, Optional
 from src.evaluation.utils.datasets import EvalDataset
-
-class SimilarityModel(metaclass=ABCMeta):
-    """
-    A abstract model for evaluating the paper similarity task.
-    Two methods to implement:
-        1. encode: Create paper encodings
-        2. get_similarity: calculate similarity between two encodings
-
-    If set_cache is called, automatically caches paper encodings (and loads them in future runs)
-    """
-    ENCODING_TYPES = ('abstract', 'sentence', 'sentence-entity')
-
-    def __init__(self, name: str, encoding_type: str, batch_size: int=8):
-        self.name = name
-        assert encoding_type in SimilarityModel.ENCODING_TYPES, 'Model output representation must be either\n' \
-                                                                '"abstract" (1 embedding for entire document)\n' \
-                                                                '"sentence" (1 embedding per each sentence)\n' \
-                                                                'or "sentence-entity" (1 embedding per each sentence ' \
-                                                                'and 1 embedding per each entity)'
-        self.encoding_type = encoding_type
-        self.batch_size = batch_size
-        self.cache = None
-
-
-    @abstractmethod
-    def encode(self, batch_papers: List[Dict]):
-        """
-        Create encodings for a batch of papers
-        :param batch_papers: List of dictionaries, each representing one paper.
-        Keys are 'ABSTRACT', 'TITLE, 'FACETS'.
-        If NER extraction ran for the dataset, 'ENTITIES' will exist.
-        :return: Union[List[Union[Tensor, np.ndarray]], Union[Tensor, np.ndarray]]
-        Encodings which represent the papers.
-        """
-        raise NotImplementedError()
-
-    @abstractmethod
-    def get_similarity(self, x: Union[Tensor, np.ndarray], y: Union[Tensor, np.ndarray]):
-        """
-        Calculate a similarity score between two encodings
-        :param x: First encoding
-        :param y: Second Encoding
-        :return: Similarity score (higher == better)
-        """
-        raise NotImplementedError()
-
-    def set_encodings_cache(self, cache_filename: str):
-        """
-        Creates a cache for encodings of papers.
-        If the cache exists, loads it.
-        Note that manually stopping a run while the cache is open might cause corruption of cache,
-        which forces us to delete it
-        :param cache_filename: filename for cache
-        """
-        try:
-            self.cache = h5py.File(cache_filename, 'a')
-        except Exception as e:
-            logging.info(f"Error: could not open encodings cache {cache_filename}.\n"
-                         f"Overwriting the cache.")
-            self.cache = h5py.File(cache_filename, 'w')
-
-    def cache_encodings(self, batch_pids: List[str], batch_papers: List[dict]):
-        """
-        Caches paper encodings in format of {paper_id: paper_encoding}
-        :param batch_pids: paper ids for the batch
-        :param batch_papers: papers for the batch
-        :return: Also returns the encodings
-        """
-        assert self.cache is not None, "Cannot cache encodings, cache is not set"
-        encodings = self.encode(batch_papers)
-        for i, pid in enumerate(batch_pids):
-            paper_encoding = encodings[i]
-            self.cache.create_dataset(name=pid, data=paper_encoding.cpu())
-        return encodings
-
-    def get_encoding(self, pids: List[str], dataset: EvalDataset) -> Dict:
-        """
-        Gets paper encodings for the paper ids.
-        If encodings are cached, loads them.
-        Else, gets papers from the dataset and encodes.
-        :param pids: paper ids
-        :param dataset: EvalDataset object
-        :return: encodings for all pids passed, in format: {pid: encoding}
-        """
-
-        # divide to cached and uncached
-        uncached_pids = [pid for pid in pids if pid not in self.cache] if self.cache is not None else pids
-        cached_pids = set(pids).difference(set(uncached_pids))
-
-        # get all cached pids
-        all_encodings = dict()
-        for pid in cached_pids:
-            all_encodings[pid] = torch.from_numpy(np.array(self.cache.get(pid)))
-
-        # encode all uncached pids
-        for batch_pids, batch_papers in batchify({pid: dataset.get(pid) for pid in uncached_pids},
-                                                 self.batch_size):
-            if self.cache is not None:
-                batch_encodings = self.cache_encodings(batch_pids, batch_papers)
-            else:
-                batch_encodings = self.encode(batch_papers)
-            all_encodings.update({pid: batch_encodings[i] for i, pid in enumerate(batch_pids)})
-        return all_encodings
-
-
-    def get_faceted_encoding(self, unfaceted_encoding: Union[Tensor, np.ndarray], facet: str, input_data: Dict):
-        """
-        Filters an encoding of a paper for a given facet.
-        If there is one embedding per entire abstract, returns it without filtering.
-        If there is one embedding per sentence, filters out sentences which are not part of that facet.
-        If there is, in addition to sentence embeddings, also one embedding per entity, filters out entities
-        derived from sentences which are not part of that facet.
-
-        :param unfaceted_encoding: Original encoding
-        :param facet: Facet to filter
-        :param input_data: Paper data from EvalDataset
-        :return: the faceted encoding
-        """
-
-        if self.encoding_type == 'abstract':
-            # if single encoding for entire abstract, cannot filter by facet
-            return unfaceted_encoding
-        else:
-            # either one embedding per sentence, or one for each sentence and one for each entity
-            # get facets of each sentence
-            labels = ['background' if lab == 'objective_label' else lab[:-len('_label')]
-                      for lab in input_data['FACETS']]
-
-            # get ids of sentences matching this facet
-            abstract_facet_ids = [i for i, k in enumerate(labels) if facet == k]
-            if self.encoding_type == 'sentence':
-                filtered_ids = abstract_facet_ids
-            else:
-                # if embedding for each entity, take embeddings from facet sentences only
-                ner_cur_id = len(labels)
-                ner_facet_ids = []
-                for i, sent_ners in enumerate(input_data['ENTITIES']):
-                    if i in abstract_facet_ids:
-                        ner_facet_ids += list(range(ner_cur_id, ner_cur_id + len(sent_ners)))
-                    ner_cur_id += len(sent_ners)
-                filtered_ids = abstract_facet_ids + ner_facet_ids
-            return unfaceted_encoding[filtered_ids]
-
-    def __del__(self):
-        if hasattr(self, 'cache') and self.cache is not None:
-            self.cache.close()
+from src.learning.facetid_models.pair_distances import AllPairMaskedWasserstein
+from src.evaluation.utils.similarity_model import SimilarityModel
 
 class AspireModel(SimilarityModel):
     """
@@ -194,12 +54,12 @@ class AspireModel(SimilarityModel):
         # calculates optimal transport between the two encodings
         dist_func = AllPairMaskedWasserstein({})
         rep_len_tup = namedtuple('RepLen', ['embed', 'abs_lens'])
-        xt = rep_len_tup(embed=x[None, :].permute(0, 2, 1), abs_lens=[len(x)])
-        yt = rep_len_tup(embed=y[None, :].permute(0, 2, 1), abs_lens=[len(y)])
+        xt = rep_len_tup(embed=x[None, :].permute(0, 2, 1).cuda(), abs_lens=[len(x)])
+        yt = rep_len_tup(embed=y[None, :].permute(0, 2, 1).cuda(), abs_lens=[len(y)])
         ot_dist = dist_func.compute_distance(query=xt, cand=yt).item()
         return -ot_dist
 
-    def encode(self, batch_papers: List[Dict]):
+    def encode(self, batch_papers: List[Dict],query_instruct:bool=False):
         # prepare input
         bert_batch, abs_lens, sent_token_idxs = prepare_abstracts(batch_abs=batch_papers,
                                                                   pt_lm_tokenizer=self.tokenizer)
@@ -208,7 +68,7 @@ class AspireModel(SimilarityModel):
             _, batch_reps_sent = self.model.forward(bert_batch=bert_batch,
                                                     abs_lens=abs_lens,
                                                     sent_tok_idxs=sent_token_idxs)
-            batch_reps = [batch_reps_sent[i, :abs_lens[i]] for i in range(len(abs_lens))]
+            batch_reps = [batch_reps_sent[i, :abs_lens[i]].cpu() for i in range(len(abs_lens))]
         return batch_reps
 
 class AspireNER(AspireModel):
@@ -218,7 +78,7 @@ class AspireNER(AspireModel):
     as new sentences to the abstract.
     Testing on csfcube suggests improved results when using this form of Input Augmentation.
     """
-    def encode(self, batch_papers: List[Dict]):
+    def encode(self, batch_papers: List[Dict], query_instruction:bool=False):
         assert 'ENTITIES' in batch_papers[0], 'No NER data for input. Please run NER/extract_entity.py and' \
                                              ' place result in {dataset_dir}/{dataset_name}-ner.jsonl'
         input_batch_with_ner = self._append_entities(batch_papers)
@@ -234,8 +94,6 @@ class AspireNER(AspireModel):
                             }
             input_batch_with_ner.append(input_sample)
         return input_batch_with_ner
-
-
 
 class BertMLM(SimilarityModel):
     """
@@ -255,8 +113,8 @@ class BertMLM(SimilarityModel):
         self.bert_max_seq_len = 500
         self.model = AutoModel.from_pretrained(full_name)
         self.model.config.output_hidden_states = True
-        # if torch.cuda.is_available():
-        #     self.model.cuda()
+        if torch.cuda.is_available():
+            self.model.cuda()
         self.model.eval()
 
     def _prepare_batch(self, batch):
@@ -300,14 +158,14 @@ class BertMLM(SimilarityModel):
         batch = [paper['TITLE'] + ' [SEP] ' + ' '.join(paper['ABSTRACT']) for paper in batch_papers]
         return batch
 
-    def encode(self, batch_papers: List[Dict]):
+    def encode(self, batch_papers: List[Dict],query_instruct:bool=False):
         input_batch = self._pre_process_input_batch(batch_papers)
         tokid_tt, seg_tt, attnmask_tt, seq_lens_tt = self._prepare_batch(input_batch)
-        # if torch.cuda.is_available():
-        #     tokid_tt = tokid_tt.cuda()
-        #     seg_tt = seg_tt.cuda()
-        #     attnmask_tt = attnmask_tt.cuda()
-        #     seq_lens_tt = seq_lens_tt.cuda()
+        if torch.cuda.is_available():
+            tokid_tt = tokid_tt.cuda()
+            seg_tt = seg_tt.cuda()
+            attnmask_tt = attnmask_tt.cuda()
+            seq_lens_tt = seq_lens_tt.cuda()
 
         # pass through bert
         with torch.no_grad():
@@ -315,8 +173,8 @@ class BertMLM(SimilarityModel):
             # top_l is [bs x max_seq_len x bert_encoding_dim]
             top_l = model_out.last_hidden_state
             batch_reps_cls = top_l[:, 0, :]
-        # if torch.cuda.is_available():
-        #     batch_reps_cls = batch_reps_cls.cpu().data.numpy()
+        if torch.cuda.is_available():
+            batch_reps_cls = batch_reps_cls.cpu().data.numpy()
         return batch_reps_cls
 
     def get_similarity(self, x: Union[Tensor, np.ndarray], y: Union[Tensor, np.ndarray]):
@@ -326,9 +184,9 @@ class SimCSE(BertMLM):
     """
     Subclass of BERT model, for 'supsimcse' and 'unsupsimcse' models
     """
-    def encode(self, batch_papers: List[Dict]):
+    def encode(self, batch_papers: List[Dict], query_instruct:bool=False):
         """
-        :param batch:
+        :param batch_papers:
         :return:
         """
         # pre-process batch
@@ -378,7 +236,6 @@ class BertNER(BertMLM):
             batch.append(title_abstract_entities)
         return batch
 
-
 class SentenceModel(SimilarityModel):
     """
     Class for SentenceTransformer models.
@@ -392,7 +249,7 @@ class SentenceModel(SimilarityModel):
         super(SentenceModel, self).__init__(**kwargs)
         self.model = SentenceTransformer(SentenceModel.MODEL_PATHS[self.name], device='cpu')
 
-    def encode(self, batch_papers: List[Dict]):
+    def encode(self, batch_papers: List[Dict],query_instruct:bool=False):
 
         # pre-process input data
         batch = []
@@ -523,7 +380,7 @@ class TrainedAbstractModel(SimilarityModel):
     }
 
     def __init__(self, trained_model_path, model_version='cur_best', **kwargs):
-        super(TrainedAbstractModel, self).__init__(encoding_type='abstract', **kwargs)
+        super(TrainedAbstractModel, self).__init__(**kwargs)
 
         run_info_filename = os.path.join(trained_model_path, 'run_info.json')
         weights_filename = os.path.join(trained_model_path, 'model_{:s}.pt'.format(model_version))
@@ -557,7 +414,7 @@ class TrainedAbstractModel(SimilarityModel):
         self.batcher = batcher
         self.tokenizer = AutoTokenizer.from_pretrained(hyper_params['base-pt-layer'])
 
-    def encode(self, batch_papers: List[Dict]):
+    def encode(self, batch_papers: List[Dict],query_instruct:bool=False):
         # pre-process input
         batch = [paper['TITLE'] + ' [SEP] ' + ' '.join(paper['ABSTRACT']) for paper in batch_papers]
         # pass through model
@@ -584,7 +441,7 @@ class TrainedSentModel(SimilarityModel):
         pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='cls')
         self.model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
 
-    def encode(self, batch_papers: List[Dict]):
+    def encode(self, batch_papers: List[Dict],query_instruct:bool=False):
 
         # pre-process papers by extracting all sentences
         batch = []
@@ -606,7 +463,6 @@ class TrainedSentModel(SimilarityModel):
         sent_sims = sklearn.metrics.pairwise.cosine_similarity(x, y)
         return float(np.max(sent_sims))
 
-
 class AspireContextNER(SimilarityModel):
     """
     Class for ASPIRE model, where each entity is represented by the average token embeddings
@@ -620,7 +476,7 @@ class AspireContextNER(SimilarityModel):
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    def encode(self, input_data):
+    def encode(self, input_data,query_instruct:bool=False):
 
         # preprocess input
         bert_batch, abs_lens, sent_token_idxs, ner_token_idxs = self._preprocess_input(input_data)
@@ -736,94 +592,309 @@ class AspireContextNER(SimilarityModel):
         # call super method with this updates input
         return super(AspireContextNER, self).get_faceted_encoding(unfaceted_encoding, facet, filtered_input_data)
 
-class TrainedTSAspireModel(SimilarityModel):
+
+logger = logging.getLogger(__name__)
+
+class TrainedAspire(SimilarityModel):
+    """Implementation of trained Aspire models.
+
+    This class handles loading and running of trained models, including
+    preprocessing, inference, and similarity computations.
     """
-    Loads and runs TSAspire models seen in the paper
-    """
 
-    # paths to two models uploaded, trained for the compsci and biomed data, respectively
-    MODEL_PATHS = {
-        'compsci': 'allenai/aspire-contextualsentence-singlem-compsci',
-        'biomed': 'allenai/aspire-contextualsentence-singlem-biomed',
-    }
+    MODEL_FILE_TEMPLATE = 'model_{}.pt'
+    RUN_INFO_FILENAME = 'run_info.json'
 
-    def __init__(self, **kwargs):
-        super(TrainedTSAspireModel, self).__init__(**kwargs)
+    def __init__(
+            self,
+            name: str,
+            encoding_type: str,
+            trained_model_path: Union[Path, str] = None,
+            batch_size: int=256,
+            model_version: str = 'cur_best',
+            ner: bool = False,
+            **kwargs
+    ):
+        """Initialize TrainedAspire model.
 
-        # load compsci/biomed model based on name
-        dataset_type = self.name.split('_')[-1]
-        model_path = AspireModel.MODEL_PATHS[dataset_type]
-        trained_model_fname = '/cs/labs/tomhope/idopinto12/aspire/runs/models/ts-aspire-biomed-train-19450412/model_cur_best.pt'
-        self.model = examples.ex_aspire_consent.AspireConSent(model_path)
-        self.model.load_state_dict(torch.load(trained_model_fname))
+        Args:
+            trained_model_path: Path to trained model directory
+            model_version: Version of model to load
+            ner: Whether to use named entity recognition
+            **kwargs: Additional arguments passed to parent
+        """
+        super().__init__(name=name, encoding_type=encoding_type,batch_size=batch_size)
+
+        self.trained_model_path = Path(trained_model_path)
+        self._validate_paths(model_version)
+
+        self.config = self._load_config()
+        self.config.model_version = model_version
+        self.model_type = ModelType(self.name.split('-')[0]) # OT or TS
+        self.ner = ner
+
+        self.model, self.batcher = self._initialize_model()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.base_pt_layer)
+        # print(self.model.bert_encoder.config.__dict__)  # Might contain transformers version
+        self._load_weights(model_version)
+        self.model.to(self._get_device())
         self.model.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    def get_similarity(self, x: Union[Tensor, np.ndarray], y: Union[Tensor, np.ndarray]):
-        # print(f" x.shape: {x.shape}, y.shape: {y.shape}")
+    def _validate_paths(self, model_version: str) -> None:
+        """Validate existence of required files."""
+        if not self.trained_model_path.exists():
+            raise ValueError(f"Model path does not exist: {self.trained_model_path}")
+
+        run_info_path = self.trained_model_path / self.RUN_INFO_FILENAME
+        weights_path = self.trained_model_path / self.MODEL_FILE_TEMPLATE.format(model_version)
+
+        if not run_info_path.exists():
+            raise FileNotFoundError(f"run_info.json not found in {self.trained_model_path}")
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Model weights not found: {weights_path}")
+
+    def _load_config(self) -> SimilarityModelConfig:
+        """Load model configuration from run_info.json."""
+        config_path = self.trained_model_path / self.RUN_INFO_FILENAME
+        return SimilarityModelConfig.from_json(config_path)
+
+    def _initialize_model(self) -> Tuple:
+        """Initialize model and batcher instances."""
+        try:
+            return ModelFactory.create_model(
+                self.name,
+                self.config,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize model: {e}")
+            raise
+
+    def _load_weights(self, model_version: str) -> None:
+        """Load model weights from file."""
+        weights_path = self.trained_model_path / self.MODEL_FILE_TEMPLATE.format(model_version)
+        try:
+            state_dict = torch.load(weights_path, map_location=self._get_device())
+            self.model.load_state_dict(state_dict, strict=False)
+        except Exception as e:
+            logger.error(f"Failed to load weights from {weights_path}: {e}")
+            raise
+
+    @staticmethod
+    def _get_device() -> torch.device:
+        """Get appropriate device for model."""
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def get_similarity(self, x: Union[Tensor, np.ndarray], y: Union[Tensor, np.ndarray]) -> float:
+        """Compute similarity between two representations."""
+        if self.model_type == ModelType.OT:
+            return TrainedAspire.negative_wasserstein_distance(x, y)
+        elif self.model_type == ModelType.TS:
+            return TrainedAspire.max_negative_pairwise_l2_distance(x, y)
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+
+    def encode(self, batch_papers: List[Dict],query_instruct:bool=False) -> List[np.ndarray]:
+        """Encode batch of papers into vector representations."""
+        processed_batch = self._preprocess_batch(batch_papers)
+        return self._run_inference(processed_batch)
+
+    def _preprocess_batch(
+            self,
+            batch_papers: List[Dict]
+    ) -> Tuple[torch.Tensor, List[int], torch.Tensor]:
+        """Preprocess batch of papers for model input."""
+        if self.ner:
+            if not all('ENTITIES' in paper for paper in batch_papers):
+                raise ValueError(
+                    'No NER data found. Please run NER/extract_entity.py or '
+                    'extract_biomedical_entities.py first.'
+                )
+            batch_papers = self._append_entities(batch_papers)
+
+        return self.batcher.prepare_abstracts(
+            batch_abs=batch_papers,
+            pt_lm_tokenizer=self.tokenizer
+        )
+
+    def _run_inference(
+            self,
+            processed_batch: Tuple[torch.Tensor, List[int], torch.Tensor]
+    ) -> List[np.ndarray]:
+        """Run model inference on processed batch."""
+        bert_batch, abs_lens, sent_token_idxs = processed_batch
+
+        with torch.inference_mode():
+            _, batch_reps_sent = self.model.partial_forward(
+                bert_batch=bert_batch,
+                abs_lens=abs_lens,
+                sent_tok_idxs=sent_token_idxs
+            )
+        batch_reps_sent = batch_reps_sent.permute(0,2,1).cpu().numpy()
+        return [
+                batch_reps_sent[i, :abs_lens[i]]
+                for i in range(len(abs_lens))
+                ]
+
+    def _append_entities(self, batch_papers: List[Dict]) -> List[Dict]:
+        """Append named entities to abstracts."""
+        processed_batch = []
+
+        for paper in batch_papers:
+            ner_list = self._extract_entities(paper['ENTITIES'])
+
+            processed_batch.append({
+                'TITLE': paper['TITLE'],
+                'ABSTRACT': paper['ABSTRACT'] + ner_list
+            })
+
+        return processed_batch
+
+    @staticmethod
+    def _extract_entities(entities) -> List[str]:
+        """Extract named entities from entity data structure."""
+        if isinstance(entities, list):
+            return [item for sublist in entities for item in sublist]
+        elif isinstance(entities, dict):
+            return [f"{entity}:{entity_type}"
+                    for entity, entity_type in entities.items()]
+        else:
+            raise ValueError(f"Unsupported entities format: {type(entities)}")
+
+    @staticmethod
+    def max_negative_pairwise_l2_distance(x, y):
         pair_dists = -1*torch.cdist(x, y)
-        # print(torch.max(pair_dists))
         return torch.max(pair_dists).item()
 
-    def encode(self, batch_papers: List[Dict]):
-        # prepare input
-        bert_batch, abs_lens, sent_token_idxs = examples.ex_aspire_consent.prepare_abstracts(batch_abs=batch_papers,
-                                                                  pt_lm_tokenizer=self.tokenizer)
-        # forward through model
-        with torch.no_grad():
-            _, batch_reps_sent = self.model.forward(bert_batch=bert_batch,
-                                                    abs_lens=abs_lens,
-                                                    sent_tok_idxs=sent_token_idxs)
-            batch_reps = [batch_reps_sent[i, :abs_lens[i]] for i in range(len(abs_lens))]
-        return batch_reps
+    @staticmethod
+    def negative_wasserstein_distance(x, y):
+        # calculates optimal transport between the two encodings
+        dist_func = AllPairMaskedWasserstein({})
+        rep_len_tup = namedtuple('RepLen', ['embed', 'abs_lens'])
+        xt = rep_len_tup(embed=x[None, :].permute(0, 2, 1).to(TrainedAspire._get_device()), abs_lens=[len(x)])
+        yt = rep_len_tup(embed=y[None, :].permute(0, 2, 1).to(TrainedAspire._get_device()), abs_lens=[len(y)])
+        ot_dist = dist_func.compute_distance(query=xt, cand=yt).item()
+        return -ot_dist
+
+    @staticmethod
+    def negative_euclidean_distance(x, y):
+        return -euclidean(x, y)
+
+    def get_batch_similarity(self, query_encoding: Union[Tensor, np.ndarray],
+                             candidate_encodings: List[Union[Tensor, np.ndarray]]) -> torch.Tensor:
+        """Compute similarities between one query and multiple candidates in batch."""
+        if self.model_type == ModelType.OT:
+            return self.batch_negative_wasserstein_distance(query_encoding, candidate_encodings)
+        elif self.model_type == ModelType.TS:
+            return self.batch_max_negative_pairwise_l2_distance(query_encoding, candidate_encodings)
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+    #
+    @staticmethod
+    def batch_negative_wasserstein_distance(query_encoding, candidate_encodings):
+        torch.cuda.empty_cache()
+        batch_size = 2048 if len(candidate_encodings) < 4096 else 4096
+        if batch_size == 2048:
+            print(f"Batch size: {batch_size}")
+        max_len = max(max(c.shape[0] for c in candidate_encodings), query_encoding.shape[0])
+        dim = query_encoding.shape[1]
+
+        pad_count = (batch_size - len(candidate_encodings) % batch_size) % batch_size
+        candidate_encodings = list(candidate_encodings) + [candidate_encodings[0]] * pad_count
+
+        padding = torch.zeros(max_len, dim).cuda()
+        stacked_candidates = torch.empty(len(candidate_encodings), max_len, dim).cuda()
+
+        def pad_and_convert(t, idx=None):
+            if isinstance(t, np.ndarray):
+                t = torch.from_numpy(t).cuda()
+            else:
+                t = t.clone().detach().cuda()
+            pad_len = max_len - t.shape[0]
+            if pad_len > 0:
+                t = torch.cat([t, padding[:pad_len]], dim=0)
+            if idx is not None:
+                stacked_candidates[idx] = t
+            return t
+
+        for i, c in enumerate(candidate_encodings):
+            pad_and_convert(c, i)
+        query_tensor = pad_and_convert(query_encoding)
+        query_batch = query_tensor.unsqueeze(0).expand(len(candidate_encodings), -1, -1)
+
+        rep_len_tup = namedtuple('RepLen', ['embed', 'abs_lens'])
+        query_tuple = rep_len_tup(
+            embed=query_batch.permute(0, 2, 1),
+            abs_lens=[query_encoding.shape[0]] * len(candidate_encodings)
+        )
+        cand_tuple = rep_len_tup(
+            embed=stacked_candidates.permute(0, 2, 1),
+            abs_lens=[c.shape[0] for c in candidate_encodings]
+        )
+
+        dists = -AllPairMaskedWasserstein({}).compute_distance(query=query_tuple, cand=cand_tuple)
+        return dists[:len(candidate_encodings) - pad_count]
+
+    @staticmethod
+    def batch_max_negative_pairwise_l2_distance(query_encoding, candidate_encodings):
+        max_len = max(max(c.shape[0] for c in candidate_encodings), query_encoding.shape[0])
+        dim = query_encoding.shape[1]
+        padding = torch.zeros(max_len, dim).cuda()
+
+        def pad_and_convert(t):
+            if isinstance(t, np.ndarray):
+                t = torch.from_numpy(t).cuda()
+            else:
+                t = t.clone().detach().cuda()
+            pad_len = max_len - t.shape[0]
+            if pad_len > 0:
+                t = torch.cat([t, padding[:pad_len]], dim=0)
+            return t
+
+        query_tensor = pad_and_convert(query_encoding)
+        cand_tensor = torch.stack([pad_and_convert(c) for c in candidate_encodings])
+
+        pair_dists = -1 * torch.cdist(query_tensor, cand_tensor)
+        # Get max over the last dimension first, then over the remaining dimension
+        max_vals, _ = torch.max(pair_dists, dim=1)
+        return torch.max(max_vals, dim=0)[0]
+
+class TrainedCoCiteModel(TrainedAspire):
+    """
+    Class for our trained models which provide only abstracts embeddings
+    """
+    def __init__(self,
+                name: str,
+                encoding_type: str,
+                trained_model_path: Union[Path, str] = None,
+                batch_size: int=64,
+                model_version: str = 'cur_best',
+                ner: bool = False,
+                **kwargs):
+        super().__init__(name=name, encoding_type=encoding_type,trained_model_path=trained_model_path,batch_size=batch_size)
+        self.device = self._get_device()
+
+    def encode(self, batch_papers: List[Dict],query_instruct:bool=False):
+        # pre-process input
+        batch = [paper['TITLE'] + ' [SEP] ' + ' '.join(paper['ABSTRACT']) for paper in batch_papers]
+        # pass through model
+        bert_batch, _, _ = self.batcher.prepare_bert_sentences(sents=batch, tokenizer=self.tokenizer)
+        ret_dict = self.model.encode(batch_dict={'bert_batch': bert_batch})
+        return ret_dict['doc_reps']
+
+    def get_similarity(self, x, y):
+        if self.model_type == ModelType.COCITE:
+            return TrainedAspire.negative_euclidean_distance(x, y)
 
 
-# class TrainedTSAspireQwen2(SimilarityModel):
-#     """
-#     Loads and runs TSAspire models seen in the paper
-#     """
-#
-#     # paths to two models uploaded, trained for the compsci and biomed data, respectively
-#     MODEL_PATHS = {
-#         'compsci': 'allenai/aspire-contextualsentence-singlem-compsci',
-#         'biomed': 'allenai/aspire-contextualsentence-singlem-biomed',
-#     }
-#
-#     def __init__(self, **kwargs):
-#         super(TrainedTSAspireModel, self).__init__(**kwargs)
-#
-#         # load compsci/biomed model based on name
-#         dataset_type = self.name.split('_')[-1]
-#         model_path = AspireModel.MODEL_PATHS[dataset_type]
-#         trained_model_fname = '/cs/labs/tomhope/idopinto12/aspire/runs/models/ts-aspire-biomed-train-19450412/model_cur_best.pt'
-#         self.model = examples.ex_aspire_consent.AspireConSent(model_path)
-#         self.model.load_state_dict(torch.load(trained_model_fname))
-#         self.model.eval()
-#         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-#
-#     def get_similarity(self, x: Union[Tensor, np.ndarray], y: Union[Tensor, np.ndarray]):
-#         pair_dists = -1 * torch.cdist(x, y)
-#         return torch.max(pair_dists).item()
-#
-#     def encode(self, batch_papers: List[Dict]):
-#         # prepare input
-#         bert_batch, abs_lens, sent_token_idxs = examples.ex_aspire_consent.prepare_abstracts(batch_abs=batch_papers,
-#                                                                   pt_lm_tokenizer=self.tokenizer)
-#         # forward through model
-#         with torch.inference_mode():
-#             _, batch_reps_sent = self.model.forward(bert_batch=bert_batch,
-#                                                     abs_lens=abs_lens,
-#                                                     sent_tok_idxs=sent_token_idxs)
-#             batch_reps = [batch_reps_sent[i, :abs_lens[i]] for i in range(len(abs_lens))]
-#         return batch_reps
 
-def get_model(model_name, trained_model_path=None) -> SimilarityModel:
+def get_model(model_name, trained_model_path=None, ner:bool=False) -> SimilarityModel:
     """
     Factory method for SimilarityModel used in evaluation
     :param model_name: name of model to create
     :param trained_model_path: If a trained model, supply path to the training
     :return: SimilarityModel
     """
+    print(model_name)
     if model_name in {'aspire_compsci', 'aspire_biomed'}:
         return AspireModel(name=model_name, encoding_type='sentence')
     elif model_name == 'specter':
@@ -832,21 +903,45 @@ def get_model(model_name, trained_model_path=None) -> SimilarityModel:
         return SimCSE(name=model_name, encoding_type='abstract')
     elif model_name == 'specter_ner':
         return BertNER(name=model_name, encoding_type='abstract')
-    elif model_name in {'sbtinybertsota', 'sbrobertanli', 'sbmpnet1B'}:
-        return SentenceModel(name=model_name, encoding_type='sentence')
+    # elif model_name in {'sbtinybertsota', 'sbrobertanli', 'sbmpnet1B'}:
+    #     return SentenceModel(name=model_name, encoding_type='sentence')
     elif model_name in {'aspire_ner_compsci', 'aspire_ner_biomed'}:
         return AspireNER(name=model_name, encoding_type='sentence-entity')
     elif model_name in {'aspire_context_ner_compsci', 'aspire_context_ner_biomed'}:
         return AspireContextNER(name=model_name, encoding_type='sentence-entity')
-    elif model_name == 'cospecter':
-        return TrainedAbstractModel(name=model_name,
-                                    trained_model_path=trained_model_path,
-                                    encoding_type='abstract')
+    # elif model_name == 'cospecter':
+    #     return TrainedAbstractModel(name=model_name,
+    #                                 trained_model_path=trained_model_path,
+    #                                 encoding_type='abstract')
     elif model_name in {'cosentbert', 'ictsentbert'}:
         return TrainedSentModel(name=model_name,
                                 trained_model_path=trained_model_path,
                                 encoding_type='sentence')
-    elif model_name in {'ts_aspire_compsci', 'ts_aspire_biomed'}:
-        return TrainedTSAspireModel(name=model_name, encoding_type='sentence')
+    elif model_name in {'ts-aspire-biomed-recon',
+                        'ts-aspire-biomed-specter2',
+                        'ot-aspire-biomed-recon',
+                        'ot-aspire-biomed-specter2',
+                        'ts-aspire-gte-qwen2-1.5b-instruct-biomed',
+                        'ot-aspire-gte-qwen2-1.5b-instruct-biomed'}:
+        return TrainedAspire(name=model_name,
+                            trained_model_path=trained_model_path,
+                            encoding_type='sentence',
+                             batch_size=256, ner=ner)
+    elif model_name in {'cocite-specter-biomed-recon',
+                        'cocite-specter-biomed-specter2',
+                        'cocite-gte-qwen2-1.5b-instruct-biomed'}:
+        return TrainedCoCiteModel(name=model_name,
+                                  trained_model_path=trained_model_path,
+                                  enscoding_type='abstract',
+                                  batch_size=64, ner=ner)
+
+    elif model_name in {"gte-qwen2-1.5b-instruct"}:
+        config = InstructModelConfig(attn_implementation="sdpa")
+        return DecSimModel(name=model_name, encoding_type='abstract', config=config, ner=ner)
+    elif model_name in {'cocite-qwen2'}:
+        pass
+    elif model_name in {'ts-aspire-biomed-qwen2',
+                        'ot-aspire-biomed-qwen2'}:
+        pass
     else:
         raise NotImplementedError(f"No Implementation for model {model_name}")

@@ -145,7 +145,9 @@ class AllPairMaskedWasserstein:
         qef_batch_size, _, qmax_sents = query_reps.size()
         cef_batch_size, encoding_dim, cmax_sents = cand_reps.size()
         pad_mask = np.ones((qef_batch_size, qmax_sents, cmax_sents))*-10e8
+        print(qef_batch_size, qmax_sents, cmax_sents)
         for i in range(qef_batch_size):
+            print(i, query_abs_lens, cand_abs_lens)
             ql, cl = query_abs_lens[i], cand_abs_lens[i]
             pad_mask[i, :ql, :cl] = 0.0
         pad_mask = Variable(torch.FloatTensor(pad_mask))

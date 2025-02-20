@@ -13,9 +13,9 @@ import torch.distributed as dist
 import torch.optim as optim
 import transformers
 
-from . import predict_utils as pu
-from . import data_utils as du
-
+from src.learning import predict_utils as pu
+from src.learning import data_utils as du
+import wandb
 
 def consume_prefix_in_state_dict_if_present(state_dict, prefix):
     r"""Strip the prefix in state_dict, if any.
@@ -267,6 +267,12 @@ class GenericTrainer:
                     # Step in the direction of the gradient.
                     self.optimizer.step()
                 if self.iteration % self.log_every == 0:
+                    wandb.log({
+                        "train_loss": objective.item(),
+                        "epoch": epoch,
+                        "iteration": self.iteration,
+                        "learning_rate": self.optimizer.param_groups[0]['lr']
+                    })
                     # Save every loss component separately.
                     loss_str = []
                     for key in ret_dict:
@@ -313,6 +319,8 @@ class GenericTrainer:
                             model=self.model, batcher=self.batcher, batch_size=self.batch_size,
                             ex_fnames=self.dev_fnames, num_examples=self.num_dev,
                             loss_helper=self.loss_function_cal)
+                        wandb.log({"dev_loss": dev_score})
+
                     dev_end = time.time()
                     total_time_per_dev += dev_end-dev_start
                     self.dev_score_history.append(dev_score)
@@ -389,7 +397,7 @@ class BasicTrainer(GenericTrainer):
         :param data_path: string; directory with all the int mapped data.
         """
         # Todo: Change trainer API.
-        raise NotImplementedError
+        # raise NotImplementedError
         GenericTrainer.__init__(self, model, batcher, train_size, dev_size,
                                 batch_size, update_rule, num_epochs, learning_rate,
                                 check_every, decay_lr_by, decay_lr_every, model_path,
@@ -445,7 +453,7 @@ class BasicRankingTrainer(GenericTrainer):
         for i in range(self.num_epochs):
             # Each run contains a copy of shuffled data for itself.
             ex_fname = {
-                'pos_ex_fname': os.path.join(model_path, 'shuffled_data', '{:s}-{:d}.jsonl'.format(train_basename, i)),
+                'pos_ex_fname': os.path.join(data_path, 'shuffled_data', '{:s}-{:d}.jsonl'.format(train_basename, i)),
             }
             self.train_fnames.append(ex_fname)
         self.dev_fnames = {
@@ -561,11 +569,11 @@ class GenericTrainerDDP:
         elif self.update_rule == 'adagrad':
             self.optimizer = optim.Adagrad(self.model.parameters(), lr=self.learning_rate)
         else:
-            raise ValueError('Unknown upate rule: {:s}'.format(self.update_rule))
+            raise ValueError('Unknown update rule: {:s}'.format(self.update_rule))
         # Reduce the learning rate every few iterations.
         self.lr_decay_method = train_hparams['lr_decay_method']
         self.decay_lr_every = train_hparams['decay_lr_every']
-        self.log_every = 5
+        self.log_every = 5 #5
        
         # Train statistics.
         self.loss_history = defaultdict(list)
@@ -585,7 +593,7 @@ class GenericTrainerDDP:
         best_params = self.model.state_dict()
         best_epoch, best_iter = 0, 0
         best_dev_score = -np.inf
-        
+
         total_time_per_batch = 0
         total_time_per_dev = 0
         train_start = time.time()
@@ -627,8 +635,17 @@ class GenericTrainerDDP:
                     objective.backward()
                     # Step in the direction of the gradient.
                     self.optimizer.step()
-                if self.iteration % self.log_every == 0:
-                    # Save every loss component separately.
+
+                if (self.iteration % self.log_every) == 0:
+                    # Gather losses from all GPUs
+                    if self.process_rank == 0:
+                        wandb.log({
+                            "train_loss": objective.item(),
+                            "epoch": epoch,
+                            "iteration": self.iteration,
+                            "learning_rate": self.optimizer.param_groups[0]['lr']
+                        })
+
                     loss_str = []
                     for key in ret_dict:
                         if torch.cuda.is_available():
@@ -638,9 +655,13 @@ class GenericTrainerDDP:
                         self.loss_history[key].append(loss_comp)
                         loss_str.append('{:s}: {:.4f}'.format(key, loss_comp))
                     self.loss_checked_iters.append(self.iteration)
+
                     if self.verbose:
                         log_str = 'Epoch: {:d}; Iteration: {:d}/{:d}; '.format(epoch, self.iteration, self.total_iters)
                         conditional_log(self.logger, self.process_rank, log_str + '; '.join(loss_str))
+                    # Reset running averages after logging
+                    running_loss = defaultdict(float)
+                    running_steps = 0
                 elif self.verbose:
                     conditional_log(self.logger, self.process_rank,
                                     f'Epoch: {epoch}; Iteration: {self.iteration}/{self.total_iters}')
@@ -670,12 +691,14 @@ class GenericTrainerDDP:
                         model=self.model.module, batcher=self.batcher, batch_size=self.batch_size,
                         ex_fnames=self.dev_fnames, num_examples=self.num_dev,
                         loss_helper=self.loss_function_cal, logger=self.logger)
+                    wandb.log({"dev_loss": dev_score})
                     dev_end = time.time()
                     total_time_per_dev += dev_end-dev_start
                     self.dev_score_history.append(dev_score)
                     self.dev_checked_iters.append(self.iteration)
                     if dev_score > best_dev_score:
                         best_dev_score = dev_score
+                        wandb.log({"best_dev_loss": dev_score})
                         # Deep copy so you're not just getting a reference.
                         best_params = copy.deepcopy(self.model.state_dict())
                         best_epoch = epoch

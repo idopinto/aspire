@@ -11,7 +11,7 @@ from transformers import AutoModel
 
 from . import pair_distances as pair_dist
 from ..models_common import generic_layers as gl
-from loss_functions import CustomTripletMarginWithDistanceLoss
+from src.learning.facetid_models.loss_functions import CustomTripletMarginWithDistanceLoss
 rep_len_tup = namedtuple('RepLen', ['embed', 'abs_lens'])
 cf_rep_len_tup = namedtuple('CFRepLen', ['embed', 'embed_cf', 'abs_lens'])
 rep_len_ali_tup = namedtuple('RepLenAli', ['embed', 'abs_lens', 'align_idxs'])
@@ -222,7 +222,7 @@ class WordSentAlignBiEnc(MySPECTER):
         :param bert_config: transformers.configuration_bert.BertConfig; bert
             hyperparam instance.
         """
-        torch.nn.Module.__init__(self)
+        super().__init__(model_hparams, bert_config)
         self.bert_config = bert_config
         self.bert_encoding_dim = 768  # bert_config.hidden_size or DistilBertConfig.dim
         self.bert_layer_count = 12 + 1  # plus 1 for the bottom most layer.
@@ -247,7 +247,7 @@ class WordSentAlignBiEnc(MySPECTER):
             raise ValueError(f'Unknown aggregation: {self.score_agg_type}')
         # Not using the random weights because they'll spoil initial alignments.
         # self.bert_layer_weights = gl.SoftmaxMixLayers(in_features=self.bert_layer_count, out_features=1, bias=False)
-        self.criterion = nn.TripletMarginWithDistanceLoss(distance_function=self.dist_function,
+        self.criterion = CustomTripletMarginWithDistanceLoss(distance_function=self.dist_function,
                                                           margin=1.0, reduction='sum')
         self.cd_svalue_l1_prop = float(model_hparams.get('cd_svalue_l1_prop', 0.0))
         self.sent_loss_prop = 1.0
@@ -577,7 +577,7 @@ class WordSentAbsAlignBiEnc(WordSentAlignBiEnc):
             raise ValueError(f'Unknown aggregation: {self.score_agg_type}')
         # Not using the random weights because they'll spoil initial alignments.
         # self.bert_layer_weights = gl.SoftmaxMixLayers(in_features=self.bert_layer_count, out_features=1, bias=False)
-        self.criterion_sent = nn.TripletMarginWithDistanceLoss(distance_function=self.dist_function,
+        self.criterion_sent = CustomTripletMarginWithDistanceLoss(distance_function=self.dist_function,
                                                                margin=1.0, reduction='sum')
         self.criterion_abs = nn.TripletMarginLoss(margin=1, p=2, reduction='sum')
         self.abs_loss_prop = float(model_hparams['abs_loss_prop'])

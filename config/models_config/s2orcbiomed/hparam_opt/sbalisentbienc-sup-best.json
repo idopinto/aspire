@@ -1,7 +1,7 @@
 {
   "model_name": "sbalisentbienc",
-  "base-pt-layer": "allenai/specter",
-  "score_aggregation": "l2lse",
+  "base-pt-layer": "allenai/specter2_base",
+  "score_aggregation": "l2max",
   "train_suffix": "cocitabsalign",
   "abs_loss_prop": 0.0,
   "sent_loss_prop": 0.0,

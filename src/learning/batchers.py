@@ -84,7 +84,10 @@ class SentTripleBatcher(GenericBatcher):
             # Access the file with the sentence level examples.
             self.pos_ex_file = codecs.open(pos_ex_fname, 'r', 'utf-8')
         self.pt_lm_tokenizer = AutoTokenizer.from_pretrained(self.bert_config_str)
-    
+
+    def get_tokenizer(self):
+        return self.pt_lm_tokenizer
+
     def next_batch(self):
         """
         Yield the next batch. Based on whether its train_mode or not yield a
@@ -490,12 +493,14 @@ class AbsSentTokBatcher(SentTripleBatcher):
         # Unpack arguments.
         query_texts = raw_feed['query_texts']
         # Get bert batches and prepare sep token indices.
+        # print("Query texts: ", query_texts)
         qbert_batch, qabs_len, qabs_senttok_idxs = AbsSentTokBatcher.prepare_abstracts(
             query_texts, pt_lm_tokenizer)
         
         # Happens in the dev set.
         if 'neg_texts' in raw_feed and 'pos_texts' in raw_feed:
             neg_texts = raw_feed['neg_texts']
+            # print("Negative texts: ", neg_texts)
             nbert_batch, nabs_len, nabs_senttok_idxs = AbsSentTokBatcher.prepare_abstracts(
                 neg_texts, pt_lm_tokenizer)
             pos_texts = raw_feed['pos_texts']
@@ -515,11 +520,14 @@ class AbsSentTokBatcher(SentTripleBatcher):
                 'query_bert_batch': qbert_batch, 'query_abs_lens': qabs_len, 'query_senttok_idxs': qabs_senttok_idxs,
                 'pos_bert_batch': pbert_batch, 'pos_abs_lens': pabs_len, 'pos_senttok_idxs': pabs_senttok_idxs
             }
+            # print("Positive texts: ", pos_texts)
+            # print(batch_dict)
         # Happens when the function is called from other scripts to encode text.
         else:
             batch_dict = {
                 'bert_batch': qbert_batch, 'abs_lens': qabs_len, 'senttok_idxs': qabs_senttok_idxs
             }
+
         return batch_dict
     
     @staticmethod
@@ -539,6 +547,7 @@ class AbsSentTokBatcher(SentTripleBatcher):
             seqs = [ex_abs['TITLE'] + ' [SEP] ']
             seqs.extend([s for s in ex_abs['ABSTRACT']])
             batch_abs_seqs.append(seqs)
+
         bert_batch, tokenized_abs, sent_token_idxs = AbsSentTokBatcher.prepare_bert_sentences(
             sents=batch_abs_seqs, tokenizer=pt_lm_tokenizer)
         

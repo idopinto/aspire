@@ -1,16 +1,22 @@
 import argparse
 import collections
+import time
+
+import torch
+import numpy as np
 from tqdm import tqdm
-from src.evaluation.utils.models import get_model, SimilarityModel
+from src.evaluation.utils.models import get_model
+from src.evaluation.utils.similarity_model import SimilarityModel
 from src.evaluation.utils.utils import *
 from src.evaluation.utils.datasets import EvalDataset
+from src.learning.facetid_models.pair_distances import AllPairMaskedWasserstein
 from src.pre_process.data_utils import create_dir
 from typing import Union
 import pandas as pd
 from src.evaluation.utils.metrics import compute_metrics
 import sys
 import logging
-
+import wandb
 
 def encode(model: SimilarityModel, dataset: EvalDataset):
     """
@@ -31,11 +37,11 @@ def encode(model: SimilarityModel, dataset: EvalDataset):
         for batch_pids, batch_papers in tqdm((batchify(uncached_ds, model.batch_size))):
             model.cache_encodings(batch_pids, batch_papers)
 
-
 def score(model: SimilarityModel,
           dataset: EvalDataset,
           facet: Union[str, None],
-          scores_filename: str):
+          scores_filename: str,
+          query_instruct:bool=False):
     """
     Calculate similarity scores between queries and their candidates in a test pool
     :param model: Model to test
@@ -59,9 +65,14 @@ def score(model: SimilarityModel,
 
         # get query encoding
         # if faceted, also filter the encoding by facet
-        query_encoding = model.get_encoding(pids=[query_pid], dataset=dataset)[query_pid]
-        if facet is not None:
-            query_encoding = model.get_faceted_encoding(query_encoding, facet, dataset.get(query_pid))
+        if query_instruct:
+            _, query_paper = next(iter(batchify({query_pid:dataset.get(query_pid)}, 1)))
+            query_encoding = model.encode(query_paper, query_instruct=query_instruct)
+        else:
+            query_encoding = model.get_encoding(pids=[query_pid], dataset=dataset)[query_pid]
+        # query_encoding = model.get_encoding(pids=[query_pid], dataset=dataset)[query_pid]
+        # if facet is not None:
+        #     query_encoding = model.get_faceted_encoding(query_encoding, facet, dataset.get(query_pid))
 
         # get candidates encoding
         candidate_pids = query_pool['cands']
@@ -98,7 +109,9 @@ def get_query_test_or_dev_split(query_id, data):
         if query_id in set(vals):
             return key
     return None
+
 def evaluate(results_dir: str,
+             model_name: str,
              facet: Union[str, None],
              dataset: EvalDataset,
              comet_exp_key=None):
@@ -113,7 +126,13 @@ def evaluate(results_dir: str,
     :return:
     """
     logging.info('Computing metrics')
-
+    # Initialize wandb if not already initialized
+    if wandb.run is None:
+        wandb.init(
+            project="aspire-experiments",
+            name=f"{model_name}_eval_{dataset.name}",
+            tags=[dataset.name, model_name, "evaluation"]
+        )
     # load score results
     results = dict()
     if facet == 'all':
@@ -145,6 +164,8 @@ def evaluate(results_dir: str,
             query_metrics['paper_id'] = query_id
             query_metrics['title'] = query_metadata.loc[query_id]['title']
             metrics.append(query_metrics)
+
+
     metrics = pd.DataFrame(metrics)
 
     # write evaluations file per query
@@ -170,6 +191,7 @@ def evaluate(results_dir: str,
             agg_results['facet'] = facet
             agg_results['split'] = split
             aggregated_metrics.append(agg_results)
+
     aggregated_metrics = pd.DataFrame(aggregated_metrics)
 
     # Write evaluation file aggregated per (facet, dev/test_split)
@@ -177,7 +199,128 @@ def evaluate(results_dir: str,
     aggregated_metrics.to_csv(aggregated_metrics_filename, index=False)
     logging.info(f'Wrote: {aggregated_metrics_filename}')
 
+    overall_test = metrics[metrics.split == 'test'][metric_columns].mean().round(4).to_dict()
+    update_results_table(model_name=model_name,
+                            dataset_name=dataset.name,
+                            metrics=overall_test)
 
+
+def update_results_table(model_name, dataset_name, metrics):
+    api = wandb.Api()
+    project = api.project("aspire-experiments")
+    # Try to load existing table artifact
+    try:
+        artifact = wandb.use_artifact('aspire-experiments/model-comparison-table:latest')
+        existing_table = artifact.get('comparison_table')
+        df = existing_table.get_dataframe()
+    except:
+        # Create new table if doesn't exist
+        df = pd.DataFrame(columns=['model', 'dataset', 'ndcg%20', 'map'])
+
+    # Add new row
+    new_row = pd.DataFrame({
+        'model': [model_name],
+        'dataset': [dataset_name],
+        'ndcg%20': [metrics['ndcg%20']],
+        'map': [metrics['av_precision']]
+    })
+
+    df = pd.concat([df, new_row], ignore_index=True)
+
+    # Create new table and artifact
+    new_table = wandb.Table(dataframe=df)
+
+    # Log as new version of artifact
+    artifact = wandb.Artifact('model-comparison-table', type='comparison')
+    artifact.add(new_table, 'comparison_table')
+    wandb.log_artifact(artifact)
+
+    return df
+
+# # Use in your evaluation function
+def score_batched(model: SimilarityModel,
+                  dataset: EvalDataset,
+                  scores_filename: str,
+                  query_batch_size: int = 128,
+                  cand_batch_size:int=1024,
+                  query_instruct:bool=False):
+    """
+    Calculate similarity scores between queries and their candidates in batches
+    for improved performance, especially with Wasserstein distance calculations.
+
+    Args:
+        model: Model to test
+        dataset: Dataset to take test pool from
+        facet: Facet of query to use. Relevant only to CSFcube dataset
+        scores_filename: Saves results here
+        batch_size: Size of batches for processing
+    """
+    # Load test pool
+    test_pool = dataset.get_test_pool(facet=None)
+
+    log_msg = f"Scoring {len(test_pool)} queries in {dataset.name} with batch_size={query_batch_size}"
+    logging.info(log_msg)
+
+    results = collections.defaultdict(list)
+
+    # Process queries in batches
+    query_pids = list(test_pool.keys())
+    for batch_start in tqdm(range(0, len(query_pids), query_batch_size)):
+        batch_query_pids = query_pids[batch_start:batch_start + query_batch_size]
+        if query_instruct:
+            queries_dict = {k: dataset.get(k) for k in batch_query_pids}
+            _, query_papers = next(iter(batchify(queries_dict, query_batch_size)))
+            query_encodings = model.encode(query_papers, query_instruct=query_instruct)
+        else:
+            # Get query encodings for the batch
+            query_encodings = model.get_encoding(pids=batch_query_pids, dataset=dataset)
+
+        # Process each query's candidates
+        for i, query_pid in enumerate(batch_query_pids):
+            start_query = time.time()
+            candidate_pids = test_pool[query_pid]['cands']
+
+            # Process candidates in sub-batches
+            candidate_similarities = {}
+            for cand_batch_start in range(0, len(candidate_pids), cand_batch_size):
+                cand_batch_pids = candidate_pids[cand_batch_start:cand_batch_start + cand_batch_size]
+
+                # Get candidate encodings for the sub-batch
+                cand_batch_encodings = model.get_encoding(pids=cand_batch_pids, dataset=dataset)
+                # If the model supports batch similarity computation
+                if hasattr(model, 'get_batch_similarity'):
+                    start = time.time()
+                    batch_sims = model.get_batch_similarity(
+                        query_encodings[query_pid],
+                        [cand_batch_encodings[pid] for pid in cand_batch_pids]
+                    )
+                    duration = time.time() - start
+                    print(f"Time for batch of {len(cand_batch_pids)} candidates: {duration:.2f}s")
+                    for pid, sim in zip(cand_batch_pids, batch_sims):
+                        candidate_similarities[pid] = sim
+                else:
+                    # Fallback to individual similarity computation
+                    for cand_pid in cand_batch_pids:
+                        similarity = model.get_similarity(
+                            query_encodings[query_pid],
+                            cand_batch_encodings[cand_pid]
+                        )
+                        candidate_similarities[cand_pid] = similarity
+
+            # Sort candidates by similarity
+            sorted_candidates = sorted(
+                candidate_similarities.items(),
+                key=lambda i: i[1],
+                reverse=True
+            )
+            results[query_pid] = [(cpid, float(-1 * sim)) for cpid, sim in sorted_candidates]
+            query_duration = time.time() - start_query
+            print(f"Time for query {i}: {query_duration:.2f}s")
+
+    # Write scores
+    with codecs.open(scores_filename, 'w', 'utf-8') as fp:
+        json.dump(results, fp)
+        logging.info(f'Wrote: {scores_filename}')
 
 def main(args):
 
@@ -199,21 +342,29 @@ def main(args):
         create_dir(results_dir)
 
     # init model and dataset
-    dataset = EvalDataset(name=args.dataset_name, root_path=args.dataset_dir)
+    dataset = EvalDataset(name=args.dataset_name, root_path=args.dataset_dir, include_ner_definitions=args.include_ner_definitions)
     model= None
     if 'encode' in args.actions or 'score' in args.actions:
         logging.info(f'Loading model: {args.model_name}')
-        model = get_model(model_name=args.model_name)
+        if args.trained_model_path:
+            print("Trained model path:", args.trained_model_path)
+            model = get_model(model_name=args.model_name, trained_model_path=args.trained_model_path, ner=args.ner)
+        else:
+            model = get_model(model_name=args.model_name, ner=args.ner)
+
         logging.info(f'Loading dataset: {args.dataset_name}')
         if args.cache:
             # init cache
             encodings_filename = get_encodings_filename(results_dir)
             logging.info(f'Setting model cache at: {encodings_filename}')
             model.set_encodings_cache(encodings_filename)
+    print(f"Evaluating {args.model_name} on {args.dataset_name}.")
 
     if 'encode' in args.actions:
+        print(f"Encoding {args.dataset_name} to {args.results_dir}.")
         # cache model's encodings of entire dataset
         encode(model, dataset)
+        print(f"Encoding complete.")
 
     if 'score' in args.actions:
         # score model on dataset's test pool
@@ -221,11 +372,18 @@ def main(args):
             for facet in FACETS:
                 score(model, dataset, facet=facet, scores_filename=get_scores_filename(results_dir, facet=facet))
         else:
-            score(model, dataset, facet=args.facet, scores_filename=get_scores_filename(results_dir, facet=args.facet))
+            if args.score_batched:
+                score_batched(model, dataset,
+                          scores_filename=get_scores_filename(results_dir, facet=args.facet),
+                          query_batch_size=16, cand_batch_size=4096)
+            else:
+                score(model, dataset, facet=args.facet, scores_filename=get_scores_filename(results_dir, facet=args.facet))
+
 
     if 'evaluate' in args.actions:
         # evaluate metrics for model scores
         evaluate(results_dir,
+                 model_name=args.model_name,
                  facet=args.facet,
                  dataset=dataset)
 
@@ -266,6 +424,12 @@ def parse_args():
                         'Score' calculates similarity scores on the dataset's test pool.
                         'Evaluate' calculates metrics based on the similarity scores predicted.
                         By default does all three.""")
+    parser.add_argument('--score_batched', help='where to score in batches', action='store_true')
+    parser.add_argument('--query_instruct', help='whether to wrap query with instruction or not', action='store_true')
+    parser.add_argument('--ner', help='whether to wrap query with instruction or not', action='store_true')
+    parser.add_argument('--include_ner_definitions', help='whether to wrap query with instruction or not', action='store_true')
+
+
     return parser.parse_args()
 
 if __name__ == '__main__':
